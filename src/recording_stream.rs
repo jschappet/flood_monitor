@@ -70,6 +70,7 @@ impl RecordingStream {
         self.current_file.write_all(&timestamp.to_le_bytes())?;
         self.current_file.write_all(&payload_len.to_le_bytes())?;
         self.current_file.write_all(raw_payload)?;
+	self.current_file.flush()?;
 
         self.current_size += record_size;
 
