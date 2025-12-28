@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, Read, BufReader};
+use std::io::{self, BufReader, Read};
 
 use meshtastic::protobufs::FromRadio;
 use meshtastic::Message;
@@ -21,24 +21,31 @@ impl Iterator for PlaybackStream {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut len_buf = [0u8; 4];
+
         if let Err(e) = self.reader.read_exact(&mut len_buf) {
-            return if e.kind() == io::ErrorKind::UnexpectedEof {
-                None
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                return None; // clean end-of-file
             } else {
-                Some(Err(e))
-            };
+                return Some(Err(e.into()));
+            }
         }
 
         let len = u32::from_le_bytes(len_buf) as usize;
         let mut buf = vec![0u8; len];
+
         if let Err(e) = self.reader.read_exact(&mut buf) {
-            return Some(Err(e));
+            // truncate / partial frame at EOF
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                eprintln!("Warning: truncated frame at end of file");
+                return None; // ignore partial frame
+            } else {
+                return Some(Err(e.into()));
+            }
         }
 
-        match FromRadio::decode(&buf[..]) {
+        match meshtastic::protobufs::FromRadio::decode(&buf[..]) {
             Ok(msg) => Some(Ok(msg)),
             Err(e) => Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
         }
     }
 }
-
