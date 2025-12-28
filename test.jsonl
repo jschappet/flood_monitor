@@ -1,0 +1,36 @@
+{
+  "raw_bytes": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "source_id": 12345,
+  "timestamp": 1766889471,
+  "decoded": {
+    "Telemetry": {
+      "battery_level": 100,
+      "voltage": 4.2,
+      "uptime_seconds": 3600
+    }
+  }
+}
+{
+  "raw_bytes": [
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "source_id": 12345,
+  "timestamp": 1766935356,
+  "decoded": {
+    "Telemetry": {
+      "battery_level": 100,
+      "voltage": 4.2,
+      "uptime_seconds": 3600
+    }
+  }
+}
