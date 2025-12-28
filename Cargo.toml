@@ -1,0 +1,11 @@
+[package]
+name = "flood_monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+log = "0.4.29"
+meshtastic = "0.1.8"
+serde = "1.0.228"
+serde_json = "1.0.148"
+tokio = "1.48.0"
