@@ -1,6 +1,7 @@
 mod playback;
 mod recording_stream;
 mod handler;
+mod radio_message;
 
 use std::env;
 
@@ -13,6 +14,11 @@ use meshtastic::utils;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::new()
+    .filter_level(log::LevelFilter::Trace )
+    .filter_module("meshtastic::connections::stream_buffer", log::LevelFilter::Error)
+    .init();
+
     let args: Vec<String> = env::args().collect();
 
     /*
@@ -23,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cargo run -- live
 
         Record mode:
-            cargo run -- record recordings/meshtastic-recording-00000.bin
+            cargo run -- record recordings
 
         Playback mode:
             cargo run -- replay recordings/meshtastic-recording-00000.bin
@@ -96,12 +102,14 @@ async fn run_record(path: &str) -> Result<(), Box<dyn std::error::Error>> {
 /* ---------------- Playback Path ---------------- */
 
 fn run_playback(path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    println!("Replaying capture from: {}", path);
+    log::info!("Replaying capture from: {}", path);
 
     let playback = PlaybackStream::open(path)?;
-
+    log::info!("Playback started");
+    
     for msg in playback {
         let from_radio = msg?;
+        //log::info!("Replayed FromRadio: {:?}", from_radio);
         handle_from_radio(from_radio);
     }
 
