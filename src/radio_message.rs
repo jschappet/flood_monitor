@@ -15,13 +15,12 @@ fn extract_data(msg: &FromRadio) -> Result<(PortNum, &[u8]), DecodeError> {
         _ => return Err(DecodeError::ExtractedData),
     };
 
-    let portnum = PortNum::from_i32(data.portnum)
-        .ok_or(DecodeError::ExtractedData)?;
+    let portnum = PortNum::from_i32(data.portnum).ok_or(DecodeError::ExtractedData)?;
 
     Ok((portnum, &data.payload))
 }
 
-/* #[derive(Debug)] 
+/* #[derive(Debug)]
 pub enum MessageType {
     Telemetry(Data),
     Text(Data),
@@ -44,6 +43,7 @@ pub enum DecodeError {
     TelemetryAppError,
     PositionAppError,
     ExtractedData,
+    LocalSystemMessage,
     //ProtobufDecodeError(prost::error::DecodeError),
 }
 
@@ -59,8 +59,16 @@ impl TryFrom<&FromRadio> for RadioMessage {
     type Error = DecodeError;
 
     fn try_from(msg: &FromRadio) -> Result<Self, Self::Error> {
+        if msg.id == 0 {
+            return Err(DecodeError::LocalSystemMessage);
+        }
+
         let (portnum, payload) = extract_data(msg)?;
-        log::trace!("Decoding RadioMessage from node {} on port {:?}", msg.id, portnum);
+        log::trace!(
+            "Decoding RadioMessage from node {} on port {:?}",
+            msg.id,
+            portnum
+        );
 
         let app = match portnum {
             PortNum::TelemetryApp => {
@@ -191,7 +199,6 @@ mod tests {
         let msg = make_from_radio(PortNum::TelemetryApp);
         let radio_msg = RadioMessage::try_from(&msg);
         assert!(radio_msg.is_err());
-
     }
 
     #[test]

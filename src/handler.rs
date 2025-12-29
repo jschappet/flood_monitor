@@ -7,6 +7,7 @@ static TELEMETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 pub fn handle_from_radio(msg: FromRadio) {
     log::debug!("FROM {} → payload present? {:?}", msg.id, msg.payload_variant);
+    
     let rm = RadioMessage::try_from(&msg);
 
     match rm {
@@ -25,8 +26,8 @@ pub fn handle_from_radio(msg: FromRadio) {
             }
             log::info!("Received message from node {}: {:?}", rm.node_id, rm.app);
         },
-        Err(_) => {
-            log::trace!("Unable to parse FromRadio message from node {}", msg.id)
+        Err(e) => {
+            log::trace!("Unable to parse FromRadio message from node {}: {:?}", msg.id, e);
         },
     }
     
