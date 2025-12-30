@@ -1,3 +1,263 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+use meshtastic::protobufs::{FromRadio, mesh_packet::PayloadVariant, PortNum};
+
+use crate::radio_message::{AppMessage, RadioMessage, Telemetry};
+
+static TELEMETRY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+pub fn handle_from_radio(msg: FromRadio) {
+    match RadioMessage::try_from(&msg) {
+        Ok(rm) => match &rm.app {
+            AppMessage::Telemetry(tel) => {
+                // Increment global telemetry counter
+                let count = TELEMETRY_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Pattern match on the specific telemetry variant
+                match tel {
+                    Telemetry::Device {
+                        battery_level,
+                        voltage,
+                        uptime_seconds,
+                    } => {
+                        log::info!(
+                            "Node {} Device Telemetry #{} → Voltage: {:?} V, Battery: {:?} %, Uptime: {:?} s",
+                            rm.node_id,
+                            count,
+                            voltage,
+                            battery_level,
+                            uptime_seconds
+                        );
+                    }
+                    Telemetry::Environment {
+                        temperature,
+                        humidity,
+                        pressure,
+                    } => {
+                        log::info!(
+                            "Node {} Environment Telemetry #{} → Temp: {:?} °C, Humidity: {:?} %, Pressure: {:?} hPa",
+                            rm.node_id,
+                            count,
+                            temperature,
+                            humidity,
+                            pressure
+                        );
+                    }
+                    Telemetry::Power { voltage, current } => {
+                        log::info!(
+                            "Node {} Power Telemetry #{} → Voltage: {:?} V, Current: {:?} A",
+                            rm.node_id,
+                            count,
+                            voltage,
+                            current
+                        );
+                    }
+                }
+            }
+            AppMessage::Position(pos) => {
+                log::info!(
+                    "Node {} Position → Lat: {:.7}, Lon: {:.7}, Alt: {} m, Accuracy: {} m",
+                    rm.node_id,
+                    pos.latitude,
+                    pos.longitude,
+                    pos.altitude,
+                    pos.accuracy
+                );
+            }
+            AppMessage::Text(text) => {
+                log::info!(
+                    "Node {} Text → From: {:?}, To: {:?}, Msg: {}",
+                    rm.node_id,
+                    text.from,
+                    text.to,
+                    text.msg
+                );
+            }
+        },
+        Err(e) => {
+            log::warn!("Failed to parse FromRadio message from node {}: {:?}", msg.id, e);
+        }
+    }
+}
+mod handler;
+mod playback;
+mod radio_message;
+mod recording_stream;
+
+use std::env;
+
+use handler::handle_from_radio;
+use playback::PlaybackStream;
+use recording_stream::RecordingStream;
+
+use meshtastic::api::StreamApi;
+use meshtastic::utils;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Debug)
+        .filter_module(
+            "meshtastic::connections::stream_buffer",
+            log::LevelFilter::Error,
+        )
+        .init();
+
+    let args: Vec<String> = env::args().collect();
+
+    /*
+        Usage:
+
+        Live mode (default):
+            cargo run
+            cargo run -- live
+
+        Record mode:
+            cargo run -- record recordings
+
+        Playback mode:
+            cargo run -- replay recordings/meshtastic-recording-00000.bin
+    */
+
+    match args.get(1).map(String::as_str) {
+        Some("replay") => {
+            let path = args.get(2).expect("missing replay file path");
+            run_playback(path)?;
+        }
+        Some("record") => {
+            let path = args.get(2).expect("missing record file path");
+            run_record(path).await?;
+        }
+        _ => {
+            run_live().await?;
+        }
+    }
+
+    Ok(())
+}
+
+/* ---------------- Live Path ---------------- */
+
+async fn run_live() -> Result<(), Box<dyn std::error::Error>> {
+    println!("Starting live Meshtastic stream…");
+
+    let stream_api = StreamApi::new();
+    let serial_stream =
+        utils::stream::build_serial_stream("/dev/ttyACM0".to_string(), None, None, None)?;
+
+    let (mut decoded_listener, stream_api) = stream_api.connect(serial_stream).await;
+    let config_id = utils::generate_rand_id();
+    let _stream_api = stream_api.configure(config_id).await?;
+
+    while let Some(from_radio) = decoded_listener.recv().await {
+        handle_from_radio(from_radio);
+    }
+
+    Ok(())
+}
+
+/* ---------------- Record Path ---------------- */
+
+async fn run_record(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!("Recording to: {}", path);
+
+    let mut recorder = RecordingStream::new(path)?;
+
+    let stream_api = StreamApi::new();
+    let serial_stream =
+        utils::stream::build_serial_stream("/dev/ttyACM0".to_string(), None, None, None)?;
+
+    let (mut decoded_listener, stream_api) = stream_api.connect(serial_stream).await;
+    let config_id = utils::generate_rand_id();
+    let _stream_api = stream_api.configure(config_id).await?;
+
+    while let Some(from_radio) = decoded_listener.recv().await {
+        let raw = meshtastic::Message::encode_to_vec(&from_radio);
+        recorder.record(&raw)?;
+
+        handle_from_radio(from_radio);
+    }
+
+    recorder.flush()?;
+    Ok(())
+}
+
+/* ---------------- Playback Path ---------------- */
+
+fn run_playback(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    log::info!("Replaying capture from: {}", path);
+
+    let playback = PlaybackStream::open(path)?;
+    log::info!("Playback started");
+
+    for msg in playback {
+        let from_radio = msg?;
+        //log::info!("Replayed FromRadio: {:?}", from_radio);
+        handle_from_radio(from_radio);
+    }
+
+    Ok(())
+}
+use std::fs::File;
+use std::io::{self, BufReader, Read};
+
+use meshtastic::protobufs::FromRadio;
+use meshtastic::Message;
+
+pub struct PlaybackStream {
+    reader: BufReader<File>,
+}
+
+impl PlaybackStream {
+    pub fn open(path: &str) -> io::Result<Self> {
+        Ok(Self {
+            reader: BufReader::new(File::open(path)?),
+        })
+    }
+}
+
+impl Iterator for PlaybackStream {
+    type Item = io::Result<FromRadio>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+    // Read 8-byte timestamp (discard for now)
+    let mut ts_buf = [0u8; 8];
+    if let Err(e) = self.reader.read_exact(&mut ts_buf) {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            return None;
+        } else {
+            return Some(Err(e.into()));
+        }
+    }
+
+    // Now read 4-byte payload length
+    let mut len_buf = [0u8; 4];
+    if let Err(e) = self.reader.read_exact(&mut len_buf) {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            return None;
+        } else {
+            return Some(Err(e.into()));
+        }
+    }
+
+    let len = u32::from_le_bytes(len_buf) as usize;
+
+    let mut buf = vec![0u8; len];
+    if let Err(e) = self.reader.read_exact(&mut buf) {
+        if e.kind() == io::ErrorKind::UnexpectedEof {
+            eprintln!("Warning: truncated frame at end of file");
+            return None;
+        } else {
+            return Some(Err(e.into()));
+        }
+    }
+
+    match FromRadio::decode(&buf[..]) {
+        Ok(msg) => Some(Ok(msg)),
+        Err(e) => Some(Err(io::Error::new(io::ErrorKind::InvalidData, e))),
+    }
+}
+
+}
 use meshtastic::{Message, protobufs::telemetry};
 
 use std::convert::TryFrom;
@@ -69,34 +329,14 @@ pub enum Telemetry {
 
 
 impl TryFrom<&[u8]> for Telemetry {
-
-    
-                
-
     type Error = DecodeError;
 
     fn try_from(payload: &[u8]) -> Result<Self, Self::Error> {
-
-
-
         use meshtastic::protobufs::{
             DeviceMetrics,
             EnvironmentMetrics,
             PowerMetrics,
         };
-
-
-
-        let decoded = DeviceMetrics::decode(payload);
-    match decoded {
-        Ok(dm) => {
-            log::debug!("Decoded DeviceMetrics telemetry: {:?}", dm);
-        },
-        Err(_) => {
-            log::warn!("Not a DeviceMetrics payload, trying EnvironmentMetrics");
-        }
-    }
-
 
         // Try DeviceMetrics first
         if let Ok(dm) = DeviceMetrics::decode(payload) {
@@ -380,3 +620,87 @@ mod tests {
         // }
     }
 }
+use std::{
+    fs::{File, OpenOptions},
+    io::{self, Write},
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const MAX_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+
+pub struct RecordingStream {
+    dir: PathBuf,
+    current_file: File,
+    current_size: u64,
+    file_index: u64,
+}
+
+
+
+impl RecordingStream {
+    pub fn new<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        std::fs::create_dir_all(&dir)?;
+
+        let stream = Self {
+            dir: dir.as_ref().to_path_buf(),
+            current_file: Self::open_file(&dir, 0)?,
+            current_size: 0,
+            file_index: 0,
+        };
+
+        Ok(stream)
+    }
+
+    fn open_file<P: AsRef<Path>>(dir: P, index: u64) -> io::Result<File> {
+        let filename = format!("meshtastic-recording-{:05}.bin", index);
+        let path = dir.as_ref().join(filename);
+
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+    }
+
+    fn rotate_if_needed(&mut self, next_record_size: u64) -> io::Result<()> {
+        if self.current_size + next_record_size <= MAX_FILE_SIZE {
+            return Ok(());
+        }
+
+        self.file_index += 1;
+        self.current_file = Self::open_file(&self.dir, self.file_index)?;
+        self.current_size = 0;
+
+        Ok(())
+    }
+
+    pub fn record(&mut self, raw_payload: &[u8]) -> io::Result<()> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_secs();
+
+        let payload_len = raw_payload.len() as u32;
+
+        let record_size =
+            8 + // timestamp
+            4 + // payload_len
+            payload_len as u64;
+
+        self.rotate_if_needed(record_size)?;
+
+        self.current_file.write_all(&timestamp.to_le_bytes())?;
+        self.current_file.write_all(&payload_len.to_le_bytes())?;
+        self.current_file.write_all(raw_payload)?;
+	self.current_file.flush()?;
+
+        self.current_size += record_size;
+
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.current_file.flush()
+    }
+}
+
