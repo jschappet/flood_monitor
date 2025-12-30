@@ -15,7 +15,7 @@ use meshtastic::utils;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Trace)
+        .filter_level(log::LevelFilter::Debug)
         .filter_module(
             "meshtastic::connections::stream_buffer",
             log::LevelFilter::Error,
