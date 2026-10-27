@@ -6,7 +6,7 @@ Bluetooth companion and repeater firmware do not provide this USB companion inte
 
 ## Run on the Raspberry Pi
 
-Use a Rust toolchain supporting edition 2024 (Rust 1.85 or newer). From the repository root:
+The project uses Rust edition 2021. Use a current stable Rust toolchain. From the repository root:
 
 ```sh
 cargo build --release --locked

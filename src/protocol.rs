@@ -1,4 +1,4 @@
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::io::{self, Read, Write};
 
 pub const MAX_FRAME: usize = 176;
@@ -140,11 +140,9 @@ mod tests {
         let mut f = Frames::default();
         assert_eq!(f.read(&mut reader).unwrap(), Some(vec![0x0c, 1]));
         assert_eq!(f.read(&mut reader).unwrap(), Some(vec![0x0a]));
-        assert!(
-            Frames::default()
-                .read(&mut Cursor::new(b">\xff\xff"))
-                .is_err()
-        );
+        assert!(Frames::default()
+            .read(&mut Cursor::new(b">\xff\xff"))
+            .is_err());
     }
     #[test]
     fn partial_frame_survives_timeout() {

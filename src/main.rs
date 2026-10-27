@@ -2,7 +2,7 @@ mod capture;
 mod protocol;
 
 use capture::Recorder;
-use protocol::{Frames, decode, hex, send};
+use protocol::{decode, hex, send, Frames};
 use std::{
     env,
     fs::File,
