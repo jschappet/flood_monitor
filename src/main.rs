@@ -18,7 +18,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .filter_level(log::LevelFilter::Debug)
         .filter_module(
             "meshtastic::connections::stream_buffer",
-            log::LevelFilter::Error,
+            log::LevelFilter::Off,
         )
         .init();
 
