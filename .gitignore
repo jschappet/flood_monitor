@@ -25,3 +25,10 @@ recordings
 # Added by cargo
 
 /target
+
+# Local metric settings and durable pending reports
+metrics.local.json
+metrics-outbox/
+# Credentials remain private even when using a custom outbox directory.
+**/device.token
+**/device.tmp

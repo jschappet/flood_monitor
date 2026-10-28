@@ -1,4 +1,5 @@
 mod capture;
+mod metrics;
 mod protocol;
 
 use capture::Recorder;
@@ -16,6 +17,8 @@ Usage:
   flood_monitor [live] [--port /dev/ttyACM0]
   flood_monitor record DIRECTORY [--port /dev/ttyACM0]
   flood_monitor replay FILE
+  flood_monitor live --metrics-config metrics.local.json [--port DEVICE]
+  flood_monitor metrics-status --metrics-config metrics.local.json
   flood_monitor --help
 
 Port defaults to MESHCORE_PORT, then /dev/ttyACM0.
@@ -40,10 +43,14 @@ struct Radio<T> {
     port: T,
     frames: Frames,
     recorder: Option<Recorder>,
+    metrics: Option<metrics::Reporter>,
 }
 impl<T: io::Read + io::Write> Radio<T> {
     fn receive(&mut self) -> io::Result<Option<Vec<u8>>> {
         let frame = self.frames.read(&mut self.port)?;
+        if let Some(reporter) = &mut self.metrics {
+            reporter.tick(frame.as_deref())?;
+        }
         if let Some(ref p) = frame {
             if let Some(r) = &mut self.recorder {
                 r.record(p)?;
@@ -92,11 +99,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         port = args.remove(i + 1);
         args.remove(i);
     }
+    let metrics_config = if let Some(i) = args.iter().position(|s| s == "--metrics-config") {
+        if i + 1 == args.len() {
+            return Err("--metrics-config requires a JSON file".into());
+        }
+        let path = args.remove(i + 1);
+        args.remove(i);
+        Some(metrics::Config::load(Path::new(&path))?)
+    } else {
+        None
+    };
     let mode = args.first().map(String::as_str).unwrap_or("live");
     let directory = match (mode, args.len()) {
+        ("metrics-status", 1) => {
+            let config = metrics_config
+                .as_ref()
+                .ok_or("metrics-status requires --metrics-config")?;
+            println!("{}", metrics::status(config)?);
+            return Ok(());
+        }
         ("live", 0 | 1) => None,
         ("record", 2) => Some(args[1].clone()),
         ("replay", 2) => {
+            if metrics_config.is_some() {
+                return Err("metrics reporting is only available in live and record modes".into());
+            }
             capture::replay(File::open(&args[1])?, |ts, p| display(p, Some(ts)))?;
             return Ok(());
         }
@@ -116,11 +143,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         port: serial,
         frames: Frames::default(),
         recorder,
+        metrics: None,
     };
     let mut start = vec![1, 0, 0, 0, 0, 0, 0, 0];
     start.extend_from_slice(b"flood-monitor");
     radio.command(&start, &[5])?;
     radio.command(&[0x16, 3], &[0x0d])?;
+    if let Some(config) = metrics_config {
+        // Do not count historical messages queued while this receiver was offline.
+        log::info!("Draining startup message backlog before starting metrics");
+        while radio.command(&[0x0a], &[7, 8, 0x10, 0x11, 0x1b, 0x0a])?[0] != 0x0a {}
+        match metrics::Reporter::start(config) {
+            Ok(reporter) => radio.metrics = Some(reporter),
+            Err(error) => log::error!("Metrics disabled: {error}. Radio reception continues."),
+        }
+    }
     log::info!("Connected. Listening for messages; press Ctrl-C to stop.");
     loop {
         receive_messages(&mut radio)?;
@@ -210,6 +247,7 @@ mod integration_tests {
             port: client,
             frames: Frames::default(),
             recorder: Some(Recorder::new(&dir).unwrap()),
+            metrics: None,
         };
         let p = radio.command(&[1, 0, 0, 0, 0, 0, 0, 0], &[5]).unwrap();
         assert_eq!(decode(&p).unwrap()["name"], "Schappet");
