@@ -4,6 +4,43 @@ Rust receiver and recorder for a MeshCore **USB/Serial Companion** radio.
 Developed against the RAK4631 v1.18.0 companion responses captured on a Raspberry Pi.
 Bluetooth companion and repeater firmware do not provide this USB companion interface.
 
+## Web messages and replies
+
+The optional web interface shows the public channel and direct conversations,
+with contact names, reply controls, UTF-8 byte limits, and outgoing delivery status.
+It shares the receiver's USB connection and runs alongside metrics; Heron needs
+no changes. Outgoing messages are not included in received-message metrics.
+
+On the Pi, build as below, then run:
+
+```sh
+export MESHCORE_WEB_TOKEN='replace-with-your-own-long-random-web-key'
+./target/release/flood_monitor live --port /dev/ttyACM0 \
+  --metrics-config metrics.local.json --web-bind 0.0.0.0:8080
+```
+
+Open `http://YOUR_PI_IP:8080` and enter that key. Choose your own random key
+(24–256 printable ASCII characters); keep it separate from the Heron device token.
+Omit `--metrics-config` to use chat alone. `--web-bind` also works with `record`.
+Without this option no web server starts. Use `--web-bind 127.0.0.1:8080` for
+access only on the Pi or through an SSH tunnel. Plain HTTP is for a trusted local
+network; use an HTTPS reverse proxy or SSH tunnel for remote access.
+
+Public channel defaults to the metrics configuration's channel, or 0. Override
+with `--public-channel N` to select the same channel for chat and metrics.
+DM recipients come from the radio's contact list. Refresh contacts after adding
+a contact to the radio. Unknown or ambiguous sender prefixes cannot be replied
+to until resolved. Public replies insert an @name mention; DMs go to the selected
+contact. Only click Send when ready to transmit over the mesh.
+
+Public sends show acceptance by the radio, which does not confirm delivery.
+DMs wait for a delivery acknowledgment, which confirms receipt, not reading.
+An unknown outcome is never retransmitted automatically. The web view holds the
+latest 1,000 messages in memory and resets when the receiver restarts; it is not
+a persistent inbox. Incoming startup backlog appears in chat but remains excluded
+from metrics. The browser remembers its access key for the current tab session;
+use Lock interface to clear it.
+
 ## Run on the Raspberry Pi
 
 The project uses Rust edition 2021. Use a current stable Rust toolchain. From the repository root:
@@ -23,7 +60,7 @@ Startup prints JSON lines for the node name/public key and firmware/model/build.
 It then retrieves queued direct and channel messages, including V3 SNR values.
 Receiving removes messages from the companion's queue, as other companion clients do.
 The application does not change radio settings, channels, or firmware, and does
-not send chat messages or adverts over the mesh.
+only sends chat messages when you use the optional web interface.
 
 ```sh
 # Receive and save incoming frames:

@@ -86,6 +86,18 @@ pub fn decode(p: &[u8]) -> Result<Value, &'static str> {
         }
     };
     Ok(match kind {
+        0x03 => {
+            need(132)?;
+            json!({"type":"contact", "public_key":hex(&p[1..33]), "name":text(&p[100..132]), "contact_type":p[33]})
+        }
+        0x82 => {
+            need(5)?;
+            json!({"type":"delivery_ack", "tag":hex(&p[1..5])})
+        }
+        0x8f => {
+            need(33)?;
+            json!({"type":"contact_deleted", "public_key":hex(&p[1..33])})
+        }
         0x05 => {
             need(58)?;
             json!({"type":"self_info", "name":text(&p[58..]), "public_key":hex(&p[4..36]), "frequency_mhz":u32_at(p,48) as f64 / 1000.0})
@@ -125,6 +137,39 @@ pub fn decode(p: &[u8]) -> Result<Value, &'static str> {
         0x01 => json!({"type":"radio_error", "payload_hex":hex(p)}),
         _ => json!({"type":"raw", "code":kind, "payload_hex":hex(p)}),
     })
+}
+
+pub fn chat_command(
+    target: &str,
+    channel: u8,
+    name: &str,
+    text: &str,
+    timestamp: u32,
+) -> Result<Vec<u8>, &'static str> {
+    let limit = if target == "public" {
+        133usize.saturating_sub(name.len() + 2)
+    } else {
+        133
+    };
+    if text.trim().is_empty() || text.len() > limit || text.contains('\0') {
+        return Err("Message is empty, contains a NUL, or exceeds the UTF-8 byte limit");
+    }
+    let mut p = if target == "public" {
+        vec![3, 0, channel]
+    } else {
+        vec![2, 0, 0]
+    };
+    p.extend_from_slice(&timestamp.to_le_bytes());
+    if target != "public" {
+        if target.len() != 12 || !target.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("Invalid contact key prefix");
+        }
+        for i in (0..12).step_by(2) {
+            p.push(u8::from_str_radix(&target[i..i + 2], 16).map_err(|_| "Invalid contact key")?);
+        }
+    }
+    p.extend_from_slice(text.as_bytes());
+    Ok(p)
 }
 
 #[cfg(test)]

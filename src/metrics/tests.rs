@@ -6,17 +6,15 @@ use std::{
     os::unix::fs::PermissionsExt,
 };
 
+static NEXT_TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
         Self(std::env::temp_dir().join(format!(
-                "flood-metrics-{}-{}",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            )))
+            "flood-metrics-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )))
     }
 }
 impl Drop for Temp {

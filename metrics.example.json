@@ -1,0 +1,10 @@
+{
+  "url": "https://YOUR-HERON-HOST/api/iot",
+  "device_id": "meshcore-schappet",
+  "name": "Schappet MeshCore traffic",
+  "ip_address": "127.0.0.1",
+  "port": 80,
+  "public_channel": 0,
+  "spool_dir": "metrics-outbox",
+  "root_ca_file": null
+}
