@@ -86,6 +86,11 @@ pub fn decode(p: &[u8]) -> Result<Value, &'static str> {
         }
     };
     Ok(match kind {
+        0x12 => {
+            need(50)?;
+            // Channel keys must never be included in terminal JSON or API output.
+            json!({"type":"channel_info", "index":p[1], "name":text(&p[2..34])})
+        }
         0x03 => {
             need(132)?;
             json!({"type":"contact", "public_key":hex(&p[1..33]), "name":text(&p[100..132]), "contact_type":p[33]})

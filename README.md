@@ -26,8 +26,8 @@ Without this option no web server starts. Use `--web-bind 127.0.0.1:8080` for
 access only on the Pi or through an SSH tunnel. Plain HTTP is for a trusted local
 network; use an HTTPS reverse proxy or SSH tunnel for remote access.
 
-Public channel defaults to the metrics configuration's channel, or 0. Override
-with `--public-channel N` to select the same channel for chat and metrics.
+The metrics Public channel defaults to the configuration's channel, or 0. Override
+with `--public-channel N` to select which channel is counted as Public in metrics.
 DM recipients come from the radio's contact list. Refresh contacts after adding
 a contact to the radio. Unknown or ambiguous sender prefixes cannot be replied
 to until resolved. Public replies insert an @name mention; DMs go to the selected
@@ -59,8 +59,8 @@ group membership. Close other applications using the port before starting.
 Startup prints JSON lines for the node name/public key and firmware/model/build.
 It then retrieves queued direct and channel messages, including V3 SNR values.
 Receiving removes messages from the companion's queue, as other companion clients do.
-The application does not change radio settings, channels, or firmware, and does
-only sends chat messages when you use the optional web interface.
+The optional web interface sends chat messages and saves hashtag channels when
+you request those actions. It does not change frequency settings or firmware.
 
 ```sh
 # Receive and save incoming frames:
@@ -73,7 +73,8 @@ only sends chat messages when you use the optional web interface.
 ./target/release/flood_monitor --help
 ```
 
-Press Ctrl-C to stop. Each received frame is flushed to the recording immediately.
+Press Ctrl-C to stop. Received frames are flushed to the recording immediately,
+except channel-information responses, which are omitted because they contain keys.
 Record mode starts a new file on each run and rotates at 10 MiB without overwriting
 existing captures. All received frames are saved, including queue notifications,
 unknown packets, and malformed application payloads. Console output suppresses
@@ -215,3 +216,27 @@ payloads, limits and platform-specific scope. Run `cargo test --locked` for
 counting, credential persistence, enrollment responses, backoff, overflow,
 rejection, corruption, timestamp freezing and local HTTP integration tests.
 Physical Pi/power-loss and deployed Heron acceptance tests remain necessary.
+
+### Other channels and hashtags
+
+The web interface loads all configured radio channels at startup. Select any
+channel in the sidebar to read and reply. Use **Refresh channels** after changing
+channel settings with another client. DMs stay in their own conversations.
+
+To use `#skagit`, open **Join a hashtag**, enter `#skagit`, and click **Join channel**.
+Wait for “Joined #skagit”, then select it in the channel list. Join the exact same
+name (including capitalization) on your other MeshCore system. The channel key
+is the first 16 bytes of SHA-256 of the full hashtag, including `#`, as specified
+by [MeshCore](https://docs.meshcore.io/companion_protocol/). Hashtags are public
+topic channels; anyone knowing the name can derive the key.
+
+Joining saves the channel on the connected radio, using only a completely empty
+slot. Slot 0 and the configured Public metrics slot are protected. Existing
+channels are never overwritten. If the channel is already joined, it is reused;
+if all slots are occupied, the interface reports this without changing them.
+Existing private channels are also listed; importing private keys and deleting
+channels are not part of this interface. Keys are excluded from web responses,
+terminal output, and recordings of channel-information frames.
+
+Other channel messages appear in chat but do not increase `public_count`.
+The existing metrics schema and Heron backend remain unchanged.

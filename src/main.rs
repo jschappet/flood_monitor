@@ -55,8 +55,10 @@ impl<T: io::Read + io::Write> Radio<T> {
             reporter.tick(frame.as_deref())?;
         }
         if let Some(ref p) = frame {
-            if let Some(r) = &mut self.recorder {
-                r.record(p)?;
+            if p.first() != Some(&0x12) {
+                if let Some(r) = &mut self.recorder {
+                    r.record(p)?;
+                }
             }
             if let Some(hub) = &self.web {
                 hub.lock().unwrap().observe(p);
@@ -179,6 +181,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     radio.command(&[0x16, 3], &[0x0d])?;
     if radio.web.is_some() {
         refresh_contacts(&mut radio)?;
+        refresh_channels(&mut radio)?;
     }
     if let Some(config) = metrics_config {
         // Do not count historical messages queued while this receiver was offline.
@@ -255,10 +258,102 @@ fn refresh_contacts<T: io::Read + io::Write>(radio: &mut Radio<T>) -> io::Result
     result
 }
 
+fn refresh_channels<T: io::Read + io::Write>(radio: &mut Radio<T>) -> io::Result<()> {
+    let hub = radio.web.clone().unwrap();
+    hub.lock().unwrap().channels_ready = false;
+    hub.lock().unwrap().channels.clear();
+    for index in 0..=255u8 {
+        match radio.command(&[31, index], &[0x12]) {
+            Ok(p) if p[1] == index => {}
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Unexpected channel index",
+                ))
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::Other
+                    && e.to_string() == "radio rejected command: 0102" =>
+            {
+                break
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    let mut s = hub.lock().unwrap();
+    s.channels_ready = true;
+    s.channels_refresh = false;
+    Ok(())
+}
+
+fn join_channel<T: io::Read + io::Write>(radio: &mut Radio<T>, name: &str) -> io::Result<String> {
+    // Refresh immediately before choosing a slot; never overwrite existing settings.
+    refresh_channels(radio)?;
+    let (name, secret) = web::hashtag(name).map_err(io::Error::other)?;
+    let hub = radio.web.clone().unwrap();
+    let index = {
+        let s = hub.lock().unwrap();
+        if let Some(c) = s
+            .channels
+            .values()
+            .find(|c| c.secret == secret && !c.empty())
+        {
+            return Ok(format!("Already joined {} (channel {})", c.name, c.index));
+        }
+        if s.channels.values().any(|c| c.name == name) {
+            return Ok(format!(
+                "Cannot join {name}: an existing channel uses that name with a different key"
+            ));
+        }
+        s.channels
+            .values()
+            .find(|c| c.index != 0 && c.index != s.channel && c.empty())
+            .map(|c| c.index)
+    };
+    let Some(index) = index else {
+        return Ok("No empty channel slots available. Existing channels were preserved.".into());
+    };
+    let mut command = vec![32, index];
+    command.extend_from_slice(name.as_bytes());
+    command.resize(34, 0);
+    command.extend_from_slice(&secret);
+    radio.command(&command, &[0])?;
+    let p = radio.command(&[31, index], &[0x12])?;
+    if p[1] != index
+        || p[34..50] != secret
+        || p[2..34].split(|b| *b == 0).next() != Some(name.as_bytes())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Channel save could not be verified",
+        ));
+    }
+    Ok(format!("Joined {name}"))
+}
+
 fn service_web<T: io::Read + io::Write>(radio: &mut Radio<T>) -> io::Result<()> {
     let Some(hub) = radio.web.clone() else {
         return Ok(());
     };
+    let join = hub.lock().unwrap().channel_join.clone();
+    if let Some(name) = join {
+        let result = join_channel(radio, &name);
+        let mut s = hub.lock().unwrap();
+        s.channel_join = None;
+        match result {
+            Ok(status) => s.channel_status = status,
+            Err(e) => {
+                s.channel_status = format!("Channel join failed: {e}");
+                if e.kind() != io::ErrorKind::Other
+                    || !e.to_string().starts_with("radio rejected command:")
+                {
+                    return Err(e);
+                }
+            }
+        }
+    } else if hub.lock().unwrap().channels_refresh {
+        refresh_channels(radio)?;
+    }
     let refresh = hub.lock().unwrap().refresh;
     if refresh {
         refresh_contacts(radio)?;
@@ -268,12 +363,19 @@ fn service_web<T: io::Read + io::Write>(radio: &mut Radio<T>) -> io::Result<()> 
         let command = {
             let mut s = hub.lock().unwrap();
             s.last_tx_timestamp = (web::unix() as u32).max(s.last_tx_timestamp.saturating_add(1));
-            if work.target != "public" && !s.can_dm(&work.target) {
+            let channel = s.channel_index(&work.target);
+            if channel.is_some_and(|i| !s.channel_available(i)) {
+                Err("Channel no longer available")
+            } else if channel.is_none() && !s.can_dm(&work.target) {
                 Err("Contact no longer available")
             } else {
                 protocol::chat_command(
-                    &work.target,
-                    s.channel,
+                    if channel.is_some() {
+                        "public"
+                    } else {
+                        &work.target
+                    },
+                    channel.unwrap_or(s.channel),
                     &s.name,
                     &work.text,
                     s.last_tx_timestamp,
@@ -282,7 +384,11 @@ fn service_web<T: io::Read + io::Write>(radio: &mut Radio<T>) -> io::Result<()> 
         };
         match command {
             Ok(command) => {
-                let expected = if work.target == "public" { 0 } else { 6 };
+                let expected = if hub.lock().unwrap().channel_index(&work.target).is_some() {
+                    0
+                } else {
+                    6
+                };
                 match radio.command(&command, &[expected]) {
                     Ok(p) => {
                         if expected == 6 && p.len() < 10 {
@@ -422,6 +528,139 @@ mod integration_tests {
         assert_eq!(events[4]["type"], "messages_waiting");
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn hashtag_join_preserves_channels_and_sends_to_selected_slot() {
+        let (client, mut device) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        device
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut slots = [
+                ("Public".to_owned(), [1; 16]),
+                ("Existing".to_owned(), [2; 16]),
+                (String::new(), [0; 16]),
+            ];
+            let mut writes = 0;
+            loop {
+                let mut header = [0; 3];
+                device.read_exact(&mut header).unwrap();
+                let mut cmd = vec![0; header[1] as usize];
+                device.read_exact(&mut cmd).unwrap();
+                let response = match cmd[0] {
+                    31 => {
+                        if let Some((name, key)) = slots.get(cmd[1] as usize) {
+                            let mut p = vec![0x12, cmd[1]];
+                            p.extend_from_slice(name.as_bytes());
+                            p.resize(34, 0);
+                            p.extend_from_slice(key);
+                            p
+                        } else {
+                            vec![1, 2]
+                        }
+                    }
+                    32 => {
+                        writes += 1;
+                        assert_eq!(cmd[1], 2);
+                        assert_eq!(cmd.len(), 50);
+                        assert_eq!(&cmd[34..], &web::hashtag("#skagit").unwrap().1);
+                        slots[2] = ("#skagit".into(), cmd[34..50].try_into().unwrap());
+                        vec![0]
+                    }
+                    3 => {
+                        assert_eq!(cmd[2], 2);
+                        assert_eq!(&cmd[7..], b"Hello Skagit");
+                        assert_eq!(writes, 1);
+                        device.write_all(&[b'>', 1, 0, 0]).unwrap();
+                        break;
+                    }
+                    _ => panic!("unexpected command"),
+                };
+                device.write_all(&[b'>', response.len() as u8, 0]).unwrap();
+                device.write_all(&response).unwrap();
+            }
+        });
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(web::State::new(0)));
+        hub.lock().unwrap().connected = true;
+        let mut radio = Radio {
+            port: client,
+            frames: Frames::default(),
+            recorder: None,
+            metrics: None,
+            web: Some(hub.clone()),
+        };
+        assert_eq!(
+            join_channel(&mut radio, "#skagit").unwrap(),
+            "Joined #skagit"
+        );
+        assert!(join_channel(&mut radio, "#skagit")
+            .unwrap()
+            .starts_with("Already joined"));
+        assert!(join_channel(&mut radio, "#other")
+            .unwrap()
+            .starts_with("No empty"));
+        hub.lock()
+            .unwrap()
+            .enqueue(web::SendRequest {
+                request_id: "skagit-send-1".into(),
+                target: "channel:2".into(),
+                text: "Hello Skagit".into(),
+            })
+            .unwrap();
+        service_web(&mut radio).unwrap();
+        assert_eq!(
+            hub.lock().unwrap().messages.back().unwrap().status,
+            "submitted"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn received_v3_public_message_reaches_web_snapshot() {
+        // Match the RAK4631's reported channel, SNR, path byte and sender text.
+        let mut payload = vec![0x11, 47, 0, 0, 0, 128, 0];
+        payload.extend_from_slice(&1793144701u32.to_le_bytes());
+        payload.extend_from_slice(b"ReVillage: Hello All. ");
+        let (client, mut device) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        device
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut command = [0; 4];
+            device.read_exact(&mut command).unwrap();
+            assert_eq!(command, [b'<', 1, 0, 10]);
+            // Notifications and RF logs may precede the queued chat response.
+            device
+                .write_all(&[b'>', 1, 0, 0x83, b'>', 3, 0, 0x88, 47, 180])
+                .unwrap();
+            device.write_all(&[b'>', payload.len() as u8, 0]).unwrap();
+            device.write_all(&payload).unwrap();
+        });
+        let hub = std::sync::Arc::new(std::sync::Mutex::new(web::State::new(0)));
+        let mut radio = Radio {
+            port: client,
+            frames: Frames::default(),
+            recorder: None,
+            metrics: None,
+            web: Some(hub.clone()),
+        };
+        receive_messages(&mut radio).unwrap();
+        let snapshot = hub.lock().unwrap().snapshot();
+        assert_eq!(snapshot["messages"].as_array().unwrap().len(), 1);
+        let message = &snapshot["messages"][0];
+        assert_eq!(message["conversation"], "public");
+        assert_eq!(message["sender"], "ReVillage");
+        assert_eq!(message["text"], "Hello All. ");
+        assert_eq!(message["direction"], "in");
+        assert_eq!(message["snr_db"], 11.75);
+        worker.join().unwrap();
+    }
+
     #[test]
     fn web_contact_sync_and_sends_share_radio_stream() {
         let (client, mut device) = UnixStream::pair().unwrap();

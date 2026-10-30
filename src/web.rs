@@ -41,6 +41,36 @@ pub struct Contact {
     pub name: String,
     pub prefix: String,
 }
+#[derive(Clone, Serialize)]
+pub struct Channel {
+    pub index: u8,
+    pub name: String,
+    #[serde(skip)]
+    pub secret: [u8; 16],
+}
+impl Channel {
+    pub fn empty(&self) -> bool {
+        self.name.is_empty() && self.secret == [0; 16]
+    }
+}
+pub fn hashtag(name: &str) -> Result<(String, [u8; 16]), &'static str> {
+    let name = name.trim();
+    let name = if name.starts_with('#') {
+        name.to_owned()
+    } else {
+        format!("#{name}")
+    };
+    if name.len() < 2
+        || name.len() > 31
+        || name[1..]
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '#')
+    {
+        return Err("Use a hashtag of 1–30 UTF-8 bytes without spaces or extra # characters");
+    }
+    let hash = ring::digest::digest(&ring::digest::SHA256, name.as_bytes());
+    Ok((name, hash.as_ref()[..16].try_into().unwrap()))
+}
 #[derive(Clone)]
 pub struct Pending {
     pub id: u64,
@@ -51,6 +81,11 @@ pub struct State {
     pub name: String,
     pub connected: bool,
     pub channel: u8,
+    pub channels: BTreeMap<u8, Channel>,
+    pub channels_ready: bool,
+    pub channels_refresh: bool,
+    pub channel_join: Option<String>,
+    pub channel_status: String,
     pub contacts: BTreeMap<String, Contact>,
     pub messages: VecDeque<Message>,
     pub outbox: VecDeque<Pending>,
@@ -67,6 +102,11 @@ impl State {
             name: "MeshCore node".into(),
             connected: false,
             channel,
+            channels: BTreeMap::new(),
+            channels_ready: false,
+            channels_refresh: false,
+            channel_join: None,
+            channel_status: String::new(),
             contacts: BTreeMap::new(),
             messages: VecDeque::new(),
             outbox: VecDeque::new(),
@@ -91,6 +131,16 @@ impl State {
     pub fn observe(&mut self, p: &[u8]) {
         let Ok(e) = decode(p) else { return };
         match e["type"].as_str().unwrap_or("") {
+            "channel_info" => {
+                self.channels.insert(
+                    p[1],
+                    Channel {
+                        index: p[1],
+                        name: e["name"].as_str().unwrap().into(),
+                        secret: p[34..50].try_into().unwrap(),
+                    },
+                );
+            }
             "self_info" => {
                 self.name = e["name"].as_str().unwrap_or("MeshCore node").into();
             }
@@ -128,11 +178,13 @@ impl State {
                     return;
                 }
                 let public = e["type"] == "channel_message";
-                if public && e["channel"] != self.channel {
-                    return;
-                }
                 let conversation = if public {
-                    "public".to_owned()
+                    let index = e["channel"].as_u64().unwrap() as u8;
+                    if index == self.channel {
+                        "public".to_owned()
+                    } else {
+                        format!("channel:{index}")
+                    }
                 } else {
                     e["sender_key_prefix"].as_str().unwrap().to_owned()
                 };
@@ -159,6 +211,20 @@ impl State {
             _ => {}
         }
     }
+    pub fn channel_index(&self, target: &str) -> Option<u8> {
+        if target == "public" {
+            Some(self.channel)
+        } else {
+            target
+                .strip_prefix("channel:")
+                .and_then(|s| s.parse::<u8>().ok())
+                .filter(|i| target == format!("channel:{i}"))
+        }
+    }
+    pub fn channel_available(&self, index: u8) -> bool {
+        self.channels.get(&index).is_some_and(|c| !c.empty())
+            || (!self.channels_ready && index == self.channel)
+    }
     pub fn can_dm(&self, prefix: &str) -> bool {
         !self.refreshing
             && self
@@ -175,7 +241,7 @@ impl State {
                 m.deadline = None;
             }
         }
-        json!({"name":self.name,"connected":self.connected,"public_channel":self.channel,"public_limit":133usize.saturating_sub(self.name.len()+2),"dm_limit":133,"contacts":self.contacts.values().collect::<Vec<_>>(),"messages":self.messages,"refreshing":self.refreshing,"contacts_error":self.contacts_error})
+        json!({"channels":self.channels.values().filter(|c| !c.empty()).collect::<Vec<_>>(),"channels_ready":self.channels_ready,"channel_status":self.channel_status,"channel_busy":self.channel_join.is_some() || self.channels_refresh,"name":self.name,"connected":self.connected,"public_channel":self.channel,"public_limit":133usize.saturating_sub(self.name.len()+2),"dm_limit":133,"contacts":self.contacts.values().collect::<Vec<_>>(),"messages":self.messages,"refreshing":self.refreshing,"contacts_error":self.contacts_error})
     }
     pub fn enqueue(&mut self, r: SendRequest) -> Result<u64, (StatusCode, &'static str)> {
         if !self.connected {
@@ -203,14 +269,31 @@ impl State {
                 "Request ID already used for another message",
             ));
         }
-        if r.target != "public" && !self.can_dm(&r.target) {
+        let channel = self.channel_index(&r.target);
+        if channel.is_some_and(|i| !self.channel_available(i)) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Channel is not configured on the radio",
+            ));
+        }
+        if channel.is_none() && !self.can_dm(&r.target) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 "Recipient is missing or ambiguous. Refresh contacts before replying.",
             ));
         }
-        chat_command(&r.target, self.channel, &self.name, &r.text, 0)
-            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        chat_command(
+            if channel.is_some() {
+                "public"
+            } else {
+                &r.target
+            },
+            channel.unwrap_or(self.channel),
+            &self.name,
+            &r.text,
+            0,
+        )
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
         if self.outbox.len() >= 32 {
             return Err((StatusCode::TOO_MANY_REQUESTS, "Send queue is full"));
         }
@@ -294,9 +377,9 @@ async fn handle(
     hub: Hub,
     key: Arc<String>,
 ) -> Result<Response<Body>, Infallible> {
-    let route = req.uri().path();
+    let route = req.uri().path().to_owned();
     if req.method() == hyper::Method::GET {
-        let asset = match route {
+        let asset = match route.as_str() {
             "/" => Some((
                 "text/html; charset=utf-8",
                 include_str!("../web/index.html"),
@@ -337,7 +420,11 @@ async fn handle(
         s.refreshing = true;
         return Ok(response(StatusCode::ACCEPTED, "application/json", "{}"));
     }
-    if route != "/api/send" {
+    if route == "/api/channels/refresh" {
+        hub.lock().unwrap().channels_refresh = true;
+        return Ok(response(StatusCode::ACCEPTED, "application/json", "{}"));
+    }
+    if route != "/api/send" && route != "/api/channels/join" {
         return Ok(error(StatusCode::NOT_FOUND, "Not found"));
     }
     if !req
@@ -357,7 +444,7 @@ async fn handle(
             }
             bytes.extend_from_slice(&chunk);
         }
-        serde_json::from_slice::<SendRequest>(&bytes).map_err(|_| ())
+        serde_json::from_slice::<Value>(&bytes).map_err(|_| ())
     };
     let r = match tokio::time::timeout(Duration::from_secs(5), read).await {
         Ok(Ok(r)) => r,
@@ -367,6 +454,35 @@ async fn handle(
                 "Invalid, oversized, or timed-out request",
             ))
         }
+    };
+    if route == "/api/channels/join" {
+        let Some(name) = r.get("name").and_then(Value::as_str) else {
+            return Ok(error(StatusCode::BAD_REQUEST, "Provide a hashtag name"));
+        };
+        let (name, _) = match hashtag(name) {
+            Ok(v) => v,
+            Err(e) => return Ok(error(StatusCode::BAD_REQUEST, e)),
+        };
+        let mut s = hub.lock().unwrap();
+        if !s.connected {
+            return Ok(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Radio is not connected",
+            ));
+        }
+        if s.channel_join.is_some() {
+            return Ok(error(
+                StatusCode::CONFLICT,
+                "A channel join is already pending",
+            ));
+        }
+        s.channel_status = format!("Joining {name}…");
+        s.channel_join = Some(name);
+        return Ok(response(StatusCode::ACCEPTED, "application/json", "{}"));
+    }
+    let r = match serde_json::from_value::<SendRequest>(r) {
+        Ok(r) => r,
+        Err(_) => return Ok(error(StatusCode::BAD_REQUEST, "Invalid send request")),
     };
     let result = hub.lock().unwrap().enqueue(r);
     Ok(match result {
@@ -446,6 +562,51 @@ mod tests {
         Arc::new(Mutex::new(s))
     }
     #[test]
+    fn hashtag_derivation_and_channel_routing() {
+        assert_eq!(
+            hex(&hashtag("#test").unwrap().1),
+            "9cd8fcf22a47333b591d96a2b848b73f"
+        );
+        assert_eq!(hashtag("skagit"), hashtag("#skagit"));
+        assert_ne!(hashtag("#Skagit"), hashtag("#skagit"));
+        for name in [
+            "",
+            "#",
+            "#two words",
+            "##test",
+            "#bad\0",
+            "#abcdefghijklmnopqrstuvwxyzabcdef",
+        ] {
+            assert!(hashtag(name).is_err());
+        }
+        let hub = ready();
+        let mut s = hub.lock().unwrap();
+        let mut info = vec![0x12, 2];
+        info.extend_from_slice(b"#skagit");
+        info.resize(34, 0);
+        info.extend_from_slice(&hashtag("#skagit").unwrap().1);
+        s.observe(&info);
+        s.channels_ready = true;
+        let mut packet = vec![0x11, 47, 0, 0, 2, 128, 0, 1, 0, 0, 0];
+        packet.extend_from_slice(b"ReVillage: On Skagit");
+        s.observe(&packet);
+        assert_eq!(s.messages[0].conversation, "channel:2");
+        let r = |target: &str| SendRequest {
+            request_id: format!("request-{}", target.replace(':', "-")),
+            target: target.into(),
+            text: "Reply".into(),
+        };
+        assert!(s.enqueue(r("channel:2")).is_ok());
+        assert!(s.enqueue(r("channel:3")).is_err());
+        assert!(s.enqueue(r("channel:02")).is_err());
+        let snapshot = s.snapshot().to_string();
+        assert!(!snapshot.contains("secret"));
+        assert!(!decode(&info)
+            .unwrap()
+            .to_string()
+            .contains(&hex(&info[34..])));
+    }
+    #[test]
     fn browser_send_is_validated_idempotent_and_bounded() {
         let hub = ready();
         let mut s = hub.lock().unwrap();
@@ -506,7 +667,8 @@ mod tests {
         let mut p = vec![8, 1, 0, 0, 1, 0, 0, 0];
         p.extend_from_slice(b"ReVillage: hello");
         s.observe(&p);
-        assert!(s.messages.is_empty());
+        assert_eq!(s.messages[0].conversation, "channel:1");
+        s.messages.clear();
         p[1] = 0;
         s.observe(&p);
         assert_eq!(s.messages[0].sender, "ReVillage");
@@ -618,6 +780,35 @@ mod tests {
         });
     }
     #[test]
+    fn channel_join_api_requires_auth_and_validates_names() {
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let hub = ready();
+            let key = Arc::new("test-web-key-123456789012345".to_owned());
+            for (auth, body, expected) in [
+                (false, r##"{"name":"#skagit"}"##, StatusCode::UNAUTHORIZED),
+                (true, r##"{"name":"#two words"}"##, StatusCode::BAD_REQUEST),
+                (true, r##"{"name":"#skagit"}"##, StatusCode::ACCEPTED),
+                (true, r##"{"name":"#other"}"##, StatusCode::CONFLICT),
+            ] {
+                let mut r = Request::builder()
+                    .method("POST")
+                    .uri("/api/channels/join")
+                    .header("content-type", "application/json");
+                if auth {
+                    r = r.header("authorization", format!("Bearer {key}"));
+                }
+                assert_eq!(
+                    handle(r.body(Body::from(body)).unwrap(), hub.clone(), key.clone())
+                        .await
+                        .unwrap()
+                        .status(),
+                    expected
+                );
+            }
+            assert_eq!(hub.lock().unwrap().channel_join.as_deref(), Some("#skagit"));
+        });
+    }
+    #[test]
     #[ignore = "Interactive browser preview using synthetic messages; no radio or API"]
     fn browser_preview() {
         let hub = start("127.0.0.1:8091".parse().unwrap(), 0).unwrap();
@@ -625,6 +816,27 @@ mod tests {
             let mut s = hub.lock().unwrap();
             s.name = "Demo — Schappet".into();
             s.connected = true;
+            s.channels_ready = true;
+            s.channels.insert(
+                0,
+                Channel {
+                    index: 0,
+                    name: "Public".into(),
+                    secret: [1; 16],
+                },
+            );
+            s.channels.insert(
+                1,
+                Channel {
+                    index: 1,
+                    name: "#skagit".into(),
+                    secret: hashtag("#skagit").unwrap().1,
+                },
+            );
+            let mut p = vec![8, 1, 0, 0];
+            p.extend_from_slice(&(unix() as u32).to_le_bytes());
+            p.extend_from_slice(b"ReVillage: Hello Skagit Valley!");
+            s.observe(&p);
             let key = "ab".repeat(32);
             s.contacts.insert(
                 key.clone(),
@@ -651,6 +863,22 @@ mod tests {
             if let Some(p) = s.outbox.pop_front() {
                 s.sent(p.id, &[0]);
             }
+            if let Some(name) = s.channel_join.take() {
+                let (name, secret) = hashtag(&name).unwrap();
+                if !s.channels.values().any(|c| c.name == name) {
+                    let index = s.channels.len() as u8;
+                    s.channels.insert(
+                        index,
+                        Channel {
+                            index,
+                            name: name.clone(),
+                            secret,
+                        },
+                    );
+                }
+                s.channel_status = format!("Joined {name} (simulated)");
+            }
+            s.channels_refresh = false;
             s.refresh = false;
             s.refreshing = false;
         }
